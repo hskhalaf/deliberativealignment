@@ -57,13 +57,20 @@ for entry in ds["train"]:
 
 prompt_template = PromptTemplate()
 
-async def fetch_response(question, expected_output):
+async def fetch_response(question, expected_output, timeout=300):
     formatted_prompt = prompt_template.generate_code_prompt(question)
     messages = [{"role": "user", "content": formatted_prompt}]
     loop = asyncio.get_running_loop()
-    response = await loop.run_in_executor(None, lambda: client.chat.completions.create(model=model, messages=messages, temperature=0.2))
-    reasoning_content = response.choices[0].message.reasoning_content
-    content = response.choices[0].message.content
+    try:
+        response = await asyncio.wait_for(loop.run_in_executor(None, lambda: client.chat.completions.create(
+            model=model, messages=messages, temperature=0.2
+        )), timeout)
+        reasoning_content = response.choices[0].message.reasoning_content
+        content = response.choices[0].message.content
+    except asyncio.TimeoutError:
+        reasoning_content = None
+        content = None
+    
     return {
         "question": question,
         "expected_output": expected_output,
@@ -73,8 +80,8 @@ async def fetch_response(question, expected_output):
 
 async def main():
     results = []
-    batch_size = 100
-    total = 1000
+    batch_size = 150
+    total = 1200
     for i in range(0, total, batch_size):
         batch_questions = questions[i:i+batch_size]
         batch_expected = expected_outputs[i:i+batch_size]
