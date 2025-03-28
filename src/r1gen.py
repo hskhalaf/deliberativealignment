@@ -36,7 +36,7 @@ class PromptTemplate:
         )
 
 openai_api_key = "EMPTY"
-openai_api_base = "http://localhost:8000/v1"
+openai_api_base = "http://localhost:8001/v1"
 
 client = OpenAI(api_key=openai_api_key,
         base_url=openai_api_base)
@@ -61,7 +61,7 @@ def make_dataset(dataset_name='verifiable-coding-problems-python-10k'):
 
     return prompt_template, questions, answers, ids
 
-async def fetch_response(model, question, expected_output, prompt_template, temp=0.2, top_p=0.95, timeout=300):
+async def fetch_response(model, question, expected_output, prompt_template, temp=0.2, top_p=0.95, timeout=60000):
 
     n_generation = 1
     temp = 0.6
@@ -71,20 +71,21 @@ async def fetch_response(model, question, expected_output, prompt_template, temp
     formatted_prompt = prompt_template.generate_code_prompt(question)
     messages = [{"role": "user", "content": formatted_prompt}]
     loop = asyncio.get_running_loop()
-    try:
-        response = await asyncio.wait_for(loop.run_in_executor(None, lambda: client.chat.completions.create(
-            model=model, 
-            messages=messages, 
-            n=n_generation,
-            temperature=temp,
-            top_p=top_p, 
-            max_tokens=max_tokens,
-        )), timeout)
-        reasoning_content = response.choices[0].message.reasoning_content
-        content = response.choices[0].message.content
-    except asyncio.TimeoutError:
-        reasoning_content = None
-        content = None
+    # try:
+    response = await asyncio.wait_for(loop.run_in_executor(None, lambda: client.chat.completions.create(
+    model=model, 
+    messages=messages, 
+    n=n_generation,
+    temperature=temp,
+    top_p=top_p, 
+    max_tokens=max_tokens,
+    )), timeout)
+    # print(response)
+    reasoning_content = response.choices[0].message.reasoning_content
+    content = response.choices[0].message.content
+    # except asyncio.TimeoutError:
+        # reasoning_content = None
+        # content = None
     
     return {
         "question": question,
@@ -115,20 +116,23 @@ async def main():
     # llm = LLM(f"deepseek-ai/DeepSeek-R1-Distill-{model}", tensor_parallel_size=n_gpus, trust_remote_code=True)
     
     results = []
-    batch_size = 64
-    for i in range(0, len(questions), batch_size):
-        print(i)
-        batched_question = questions[i:i+batch_size]
-        batched_answer = answers[i:i+batch_size]
-        tasks = [fetch_response(model, q, exp, prompt_template) for q, exp in zip(batched_question, batched_answer)]
-        # results = run_llms(llm, sampling_params, formatted_question)
-        batch_results = await asyncio.gather(*tasks)
-        # results.extend(batch_results)
-        print(batch_results[0]['response'])
+    batch_size = 128
+    for j in range(5):
+        for i in range(0, len(questions), batch_size):
+            print(i)
+            batched_question = questions[i:i+batch_size]
+            batched_answer = answers[i:i+batch_size]
+            tasks = [fetch_response(model, q, exp, prompt_template) for q, exp in zip(batched_question, batched_answer)]
+            # results = run_llms(llm, sampling_params, formatted_question)
+            batch_results = await asyncio.gather(*tasks)
+            results.extend(batch_results)
+            # if batch_results[0]['response'] == None:
+                # print('here is none ', i)
+            # print(batch_results[0]['response'])
 
-        with open(f"results/{model.lower()}.jsonl", "a+") as f:
-            for item in batch_results:
-                f.write(json.dumps(item) + "\n")
+            with open(f"results/{model.lower()}_new{j}.jsonl", "a+") as f:
+                for item in batch_results:
+                    f.write(json.dumps(item) + "\n")
 
 
 if __name__ == "__main__":

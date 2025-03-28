@@ -168,9 +168,9 @@ def extract_code_blocks(text):
     # print(len(matches))
     # print(matches[0][1])
     if matches == []:
-        print(text)
-        return [text]
-    return [matches[0][1]]
+        # print(text)
+        return [text], False
+    return [matches[0][1]], True
 
 def _temp_run(sample, generation, debug, result, metadata_list, timeout):
     res, metadata = run_test(sample, test=generation, debug=debug, timeout=timeout)
@@ -641,7 +641,8 @@ def make_function(code: str) -> str:
 
 def main():
     path = 'results/deepseek-ai/'
-    model = 'deepseek-r1-distill-qwen-32b'
+    model = 'deepseek-r1-distill-qwen-7b'
+    filename = path + model + '_new.jsonl'
     hash_map = {}
     cnt = 0
     
@@ -651,9 +652,10 @@ def main():
     reasonings = []
 
     n_samples = 0
-    with open(path + model + '.jsonl', 'r') as f:
+    outputnone = 0
+    reasoningnone = 0
+    with open(filename, 'r') as f:
         for i, line in enumerate(f):
-            # print(i)
             n_samples += 1
             data = json.loads(line)
             question, answer, output, reasoning = data['question'], data['expected_output'], data['response'], data['reasoning']
@@ -661,36 +663,27 @@ def main():
                 continue
             cnt += 1
             questions.append(data['question'])
-            # print(data['question'])
             answers.append(data['expected_output'])
-            # answers.append(data['answer'])
-                # print(data['response'])
             outputs.append(data['response'])
             reasonings.append(data['reasoning'])
             
             hash_map[cnt] = i
-    print(len(reasonings))
     cnt = 0 
     lenghts = []
     for i, reasoning in enumerate(reasonings):
         if reasoning != None and 'wait' in reasoning:
-            # print(reasoning)
             cnt += 1
         if reasoning != None:
             lenghts.append(len(reasoning))
-    # print(lenghts)
-    # print(len(lenghts))
-    # print(cnt)
 
     print('# of data :', len(outputs))
     output_codes = []
+    cnt = 0
     for i, (question, answer, output) in enumerate(zip(questions, answers, outputs)):
-        # print(question)
-        # print(answer)
-        output_code = extract_code_blocks(output)
+        output_code, flag = extract_code_blocks(output)
+        if flag == False:
+            cnt += 1
         output_codes.append(output_code)
-        # print(output_code)
-        # print(answer['test_cases'][0])
     results, metadata = evaluate_generations(answers,output_codes, debug=False)
     cnt = 0
     print(results)
@@ -705,6 +698,4 @@ def main():
     
     with open(path + model + '_label.pkl', "wb") as f:
         pickle.dump(labels, f)
-
-if __name__ == "__main__":
-    main()
+main()

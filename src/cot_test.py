@@ -1,16 +1,12 @@
 import pandas as pd
 from datasets import Dataset, DatasetDict, ClassLabel
-from transformers import LlamaTokenizer, LlamaForSequenceClassification, TrainingArguments, Trainer, TrainerCallback,TrainerState, TrainerControl
+from transformers import LlamaTokenizer, LlamaForSequenceClassification, TrainingArguments, Trainer
 from peft import get_peft_model, LoraConfig, TaskType
 import torch
 import json
 import pickle
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import roc_auc_score
-
-from accelerate import Accelerator
-
 
 # ========== 1. Loading a datset ==========
 
@@ -24,7 +20,7 @@ with open(path + model + '_label.pkl', 'rb') as f:
     labels = pickle.load(f)
 
 new_labels = []
-with open(path + model + '_new.jsonl', 'r') as f:
+with open(path + model + '.jsonl', 'r') as f:
     for i, line in enumerate(f):
         data = json.loads(line)
         question, answer, output, reasoning = data['question'], data['expected_output'], data['response'], data['reasoning']
@@ -59,16 +55,9 @@ dataset = DatasetDict({
 # ========== 2. Loading Llama and tokenizer ==========
 
 # model_name = "meta-llama/Llama-2-7b-hf"
-# model_name = "meta-llama/Meta-Llama-3-8B"
-# tokenizer = LlamaTokenizer.from_pretrained(model_name)
-# tokenizer.pad_token = tokenizer.eos_token  # LLaMA doesn't have pad, 
-
-
-from transformers import AutoTokenizer
-
 model_name = "meta-llama/Meta-Llama-3-8B"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-tokenizer.pad_token = tokenizer.eos_token
+tokenizer = LlamaTokenizer.from_pretrained(model_name)
+tokenizer.pad_token = tokenizer.eos_token  # LLaMA doesn't have pad, 
 
 base_model = LlamaForSequenceClassification.from_pretrained(
     model_name,
@@ -104,8 +93,8 @@ eval_dataset = dataset["test"] #.select(range(500))
 # ========== 5. TrainingArguments 설정 ==========
 training_args = TrainingArguments(
     output_dir="./llama-binary-cls",
-    per_device_train_batch_size=1,
-    per_device_eval_batch_size=1,
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
     num_train_epochs=10,
     evaluation_strategy="epoch",
     save_strategy="epoch",
@@ -113,23 +102,15 @@ training_args = TrainingArguments(
     max_grad_norm=1.0,
     logging_steps=10,
     save_total_limit=2,
-    # fsdp_config='/mnt/shared-research-data/huggingface/accelerate/default_config.yaml',
-    # fsdp_strategy="full_shard",
     fp16=False,
     bf16=True,
     report_to="none"
 )
 
-accelerator = Accelerator()
-
-# model, train_dataset, eval_dataset = accelerator.prepare(
-    #   model, train_dataset, eval_dataset
-# )
-
-
 from collections import Counter
 # print(Counter([len(t.split()) for t in train_dataset['text']]))  # 길이 분포 확인
 
+        
 # sample = next(iter(torch.utils.data.DataLoader(train_dataset, batch_size=1)))
 # print(sample["input_ids"].dtype)  # => torch.int64
 # print(sample["attention_mask"].dtype)
@@ -141,5 +122,5 @@ trainer = Trainer(
     train_dataset=train_dataset,
     eval_dataset=eval_dataset,
 )
-trainer = accelerator.prepare(trainer)
+
 trainer.train()
