@@ -1,22 +1,18 @@
 import argparse
-import asyncio
 import json
-import os
 import random
-import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any, List
 from datetime import datetime
 
 import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    LogitsProcessor,
     GenerationConfig,
-    TextIteratorStreamer,
+    LogitsProcessor,
 )
-from tqdm.asyncio import tqdm
+from tqdm import tqdm
 
 # ──────────────────────────────────────────────────────────────────────────
 # 1.  Prompt template
@@ -52,9 +48,8 @@ class PromptTemplate:
             answer_end_tag="</answer>",
         )
 
-
 # ──────────────────────────────────────────────────────────────────────────
-# 2.  Batched Thinking‑token budget processor
+# 2.  Batched Thinking-token budget processor
 # ──────────────────────────────────────────────────────────────────────────
 class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
     """
@@ -62,12 +57,11 @@ class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
     Each sequence gets its own budget tracking.
     """
 
-    def __init__(self, tokenizer, max_thinking_tokens: int, batch_size: int, prompt_lengths: List[int]):
+    def __init__(self, tokenizer, max_thinking_tokens: int, batch_size: int):
         super().__init__()
         self.tok = tokenizer
         self.max_tokens = max_thinking_tokens
         self.batch_size = batch_size
-        self.prompt_lengths = prompt_lengths
 
         # Tag tokens
         self.think_end = tokenizer.encode("</think>", add_special_tokens=False)  
@@ -79,8 +73,7 @@ class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
         self.forcing_closure = [False] * batch_size
         self.NINF = float("-inf")
         
-        # print(f"DEBUG: Batched processor initialized for {batch_size} sequences")
-        # print(f"DEBUG: Max thinking tokens: {max_thinking_tokens}")
+        print(f"DEBUG: Batched processor initialized for {batch_size} sequences, max tokens: {max_thinking_tokens}")
 
     def _endswith(self, ids: List[int], suffix: List[int]) -> bool:
         return len(ids) >= len(suffix) and ids[-len(suffix) :] == suffix
@@ -91,27 +84,22 @@ class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
         for batch_idx in range(batch_size):
             if batch_idx >= len(self.in_think):
                 continue
-                
-            ids = input_ids[batch_idx].tolist()
             
-            # Count only generated tokens (after prompt)
-            generated_tokens = len(ids) - self.prompt_lengths[batch_idx]
-            if generated_tokens <= 0:
-                continue
-                
-            self.generation_steps[batch_idx] = generated_tokens
+            # Use generation steps instead of prompt lengths to avoid padding issues
+            self.generation_steps[batch_idx] += 1
+            ids = input_ids[batch_idx].tolist()
             
             if self.in_think[batch_idx]:
                 # Check if we naturally hit </think>
                 if self._endswith(ids, self.think_end):
-                    # print(f"DEBUG: Batch {batch_idx} - Natural </think> found at token {generated_tokens}")
+                    print(f"DEBUG: Batch {batch_idx} - Natural </think> found at step {self.generation_steps[batch_idx]}")
                     self.in_think[batch_idx] = False
                     self.forcing_closure[batch_idx] = False
                     continue
                 
                 # Check if we've hit our budget
-                if generated_tokens >= self.max_tokens and not self.forcing_closure[batch_idx]:
-                    # print(f"DEBUG: Batch {batch_idx} - Hit budget at token {generated_tokens}, forcing </think>")
+                if self.generation_steps[batch_idx] >= self.max_tokens and not self.forcing_closure[batch_idx]:
+                    print(f"DEBUG: Batch {batch_idx} - Hit budget at step {self.generation_steps[batch_idx]}, forcing </think>")
                     self.forcing_closure[batch_idx] = True
                 
                 # If we're forcing closure, manipulate the logits for this sequence
@@ -124,11 +112,6 @@ class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
                         scores[batch_idx, self.think_end[0]] = 0.0
 
         return scores
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# 3.  Utility: split reasoning / answer (unchanged)
-# ──────────────────────────────────────────────────────────────────────────
 
 def split_reasoning_answer(text: str, tokenizer=None):
     """Split the generated text into reasoning and answer parts."""
@@ -174,9 +157,6 @@ def split_reasoning_answer(text: str, tokenizer=None):
     
     return reasoning, answer, reasoning_tokens, answer_tokens
 
-# ──────────────────────────────────────────────────────────────────────────
-# 4.  Data loading (unchanged)
-# ──────────────────────────────────────────────────────────────────────────
 def load_dataset(path: str = "prompts.json", limit: int = -1, seed: int = 42):
     data = json.loads(Path(path).read_text(encoding="utf‑8"))
     prompts = [d["prompt"] for d in data]
@@ -188,11 +168,7 @@ def load_dataset(path: str = "prompts.json", limit: int = -1, seed: int = 42):
         shuff = shuff[:limit]
     return [p for p, _ in shuff], [c for _, c in shuff]
 
-
-# ──────────────────────────────────────────────────────────────────────────
-# 5.  Batched generation function
-# ──────────────────────────────────────────────────────────────────────────
-async def generate_batch(
+def generate_batch_sync(
     model,
     tokenizer,
     questions: List[str],
@@ -202,8 +178,6 @@ async def generate_batch(
     top_p: float,
     max_new: int,
     prompt_template: PromptTemplate,
-    executor,
-    timeout: int = 300,
 ):
     # Generate prompts for all questions
     prompts = [prompt_template.generate(q) for q in questions]
@@ -212,23 +186,15 @@ async def generate_batch(
     inputs = tokenizer(
         prompts,
         return_tensors="pt",
-        padding=True,  # Pad to longest sequence in batch
+        padding=True,
         truncation=True,
-        max_length=4096,  # Adjust based on your model's context length
+        max_length=4096,
         add_special_tokens=False,
-    ).to(model.device)
+    ).to(model.device)  # Use model.device
     
-    # Get prompt lengths for budget processor
-    prompt_lengths = []
-    for i, prompt in enumerate(prompts):
-        # Count actual tokens (not padded length)
-        actual_tokens = tokenizer(prompt, add_special_tokens=False)['input_ids']
-        prompt_lengths.append(len(actual_tokens))
-    
+    # Create thinking budget processor
     batch_size = len(questions)
-    processor = BatchedThinkingTokenBudgetProcessor(
-        tokenizer, think_budget, batch_size, prompt_lengths
-    )
+    processor = BatchedThinkingTokenBudgetProcessor(tokenizer, think_budget, batch_size)
     
     gen_cfg = GenerationConfig(
         do_sample=True,
@@ -240,48 +206,24 @@ async def generate_batch(
         eos_token_id=tokenizer.eos_token_id,
     )
 
-    loop = asyncio.get_running_loop()
-
-    try:
-        outputs = await asyncio.wait_for(
-            loop.run_in_executor(
-                executor,
-                lambda: model.generate(
-                    **inputs,
-                    generation_config=gen_cfg,
-                    logits_processor=[processor],
-                    use_cache=True,
-                ),
-            ),
-            timeout=timeout,
+    # DIRECT SYNCHRONOUS GENERATION
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            generation_config=gen_cfg,
+            logits_processor=[processor],  # Add back the thinking budget processor
+            use_cache=True,
         )
-    except asyncio.TimeoutError:
-        return [
-            dict(question=q, response=None, reasoning=None, conflict=c, 
-                 reasoning_tokens=0, response_tokens=0)
-            for q, c in zip(questions, conflicts)
-        ]
-    except Exception as e:
-        print(f"Generation error: {e}")
-        return [
-            dict(question=q, response=None, reasoning=None, conflict=c,
-                 reasoning_tokens=0, response_tokens=0)
-            for q, c in zip(questions, conflicts)
-        ]
 
-    # Process results for each sequence in the batch
+    # Process results
     results = []
     for i, (question, conflict) in enumerate(zip(questions, conflicts)):
-        # FIXED: Decode full sequence and use string splitting
         full_text = tokenizer.decode(outputs[i], skip_special_tokens=True)
         
-        # Extract only the generated part after "Assistant: <think>"
         if "Assistant: <think>" in full_text:
             new_text = full_text.split("Assistant: <think>", 1)[1]
-            # Prepend the opening tag since split removed it
             new_text = "<think>" + new_text
         else:
-            # Fallback for edge cases
             new_text = full_text
         
         reasoning, answer, reasoning_tokens, response_tokens = split_reasoning_answer(new_text, tokenizer)
@@ -293,13 +235,10 @@ async def generate_batch(
             reasoning_tokens=reasoning_tokens,
             response_tokens=response_tokens
         ))
+    
     return results
 
-
-# ──────────────────────────────────────────────────────────────────────────
-# 6.  Main async loop (updated for batching)
-# ──────────────────────────────────────────────────────────────────────────
-async def run(
+def run_sync(
     model_name: str,
     prompts_path: str,
     batch: int,
@@ -326,90 +265,57 @@ async def run(
     print(f"Loaded {len(prompts)} prompts")
     
     template = PromptTemplate()
-
-    output_dir.mkdir(parents=True, exist_ok=True)
     
-    # CREATE ONE TIMESTAMPED FILE PER RUN
+    # Create timestamped output file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_short = model_name.split('/')[-1]
-    outfile = output_dir / f"{model_short}_think{think_tokens}_batch{batch}_{timestamp}.jsonl"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    outfile = output_dir / f"{model_short}_think{think_tokens}_{timestamp}.jsonl"
     
     print(f"Output file: {outfile}")
-
-    # CLEAR THE FILE AT START OF RUN (not per batch)
     if outfile.exists():
         outfile.unlink()
 
-    # Use a single ThreadPoolExecutor for the blocking model.generate calls
-    from concurrent.futures import ThreadPoolExecutor
-
-    # Track statistics
+    # Process batches
     all_reasoning_tokens = []
     all_response_tokens = []
+    
+    for i in tqdm(range(0, len(prompts), batch), desc="Processing batches"):
+        batch_prompts = prompts[i : i + batch]
+        batch_conflicts = conflicts[i : i + batch]
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        # Process in true GPU batches
-        batch_count = (len(prompts) + batch - 1) // batch
-        batch_pbar = tqdm(range(0, len(prompts), batch), desc="Processing GPU batches", unit="batch")
-        
-        for i in batch_pbar:
-            batch_prompts = prompts[i : i + batch]
-            batch_conflicts = conflicts[i : i + batch]
+        # Direct synchronous call
+        results = generate_batch_sync(
+            model,
+            tokenizer,
+            batch_prompts,
+            batch_conflicts,
+            think_tokens,
+            temperature,
+            top_p,
+            max_new,
+            template,
+        )
 
-            # Single batched generation call
-            results = await generate_batch(
-                model,
-                tokenizer,
-                batch_prompts,
-                batch_conflicts,
-                think_tokens,
-                temperature,
-                top_p,
-                max_new,
-                template,
-                pool,
-            )
-
-            # Collect statistics and save ALL BATCHES TO SAME FILE
-            batch_reasoning_tokens = []
-            batch_response_tokens = []
-            
-            # APPEND MODE - adds each batch to the same file
-            with outfile.open("a", encoding="utf‑8") as f:
-                for obj in results:
-                    f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-                    if obj.get('reasoning_tokens', 0) > 0:
-                        batch_reasoning_tokens.append(obj['reasoning_tokens'])
-                        all_reasoning_tokens.append(obj['reasoning_tokens'])
-                    if obj.get('response_tokens', 0) > 0:
-                        batch_response_tokens.append(obj['response_tokens'])
-                        all_response_tokens.append(obj['response_tokens'])
-
-            # Display batch statistics
-            avg_reasoning = sum(batch_reasoning_tokens) / len(batch_reasoning_tokens) if batch_reasoning_tokens else 0
-            avg_response = sum(batch_response_tokens) / len(batch_response_tokens) if batch_response_tokens else 0
-            
-            batch_pbar.set_postfix({
-                'reasoning_tokens': f'{avg_reasoning:.1f}',
-                'response_tokens': f'{avg_response:.1f}',
-                'processed': f'{i+len(batch_prompts)}/{len(prompts)}'
-            })
+        # Save results
+        with outfile.open("a", encoding="utf‑8") as f:
+            for obj in results:
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                if obj.get('reasoning_tokens', 0) > 0:
+                    all_reasoning_tokens.append(obj['reasoning_tokens'])
+                if obj.get('response_tokens', 0) > 0:
+                    all_response_tokens.append(obj['response_tokens'])
 
     # Final statistics
     if all_reasoning_tokens and all_response_tokens:
         print(f"\nFinal Statistics:")
         print(f"Average reasoning tokens: {sum(all_reasoning_tokens) / len(all_reasoning_tokens):.1f}")
         print(f"Average response tokens: {sum(all_response_tokens) / len(all_response_tokens):.1f}")
-        print(f"Total samples processed: {len(all_reasoning_tokens)}")
     
     print(f"Results saved to: {outfile}")
 
-
-# ──────────────────────────────────────────────────────────────────────────
-# 7.  CLI entry‑point (unchanged)
-# ──────────────────────────────────────────────────────────────────────────
 def cli():
-    p = argparse.ArgumentParser(description="HF chat with GPU batching and thinking‑token budget")
+    p = argparse.ArgumentParser(description="HF chat with GPU batching and thinking-token budget")
     p.add_argument("--model", default="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B")
     p.add_argument("--prompts", default="prompts.json")
     p.add_argument("--output", default="safetyresults")
@@ -423,18 +329,16 @@ def cli():
     args = p.parse_args()
 
     try:
-        asyncio.run(
-            run(
-                model_name=args.model,
-                prompts_path=args.prompts,
-                batch=args.batch,
-                think_tokens=args.think_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                max_new=args.max_new,
-                output_dir=Path(args.output),
-                row_limit=args.limit
-            )
+        run_sync(
+            model_name=args.model,
+            prompts_path=args.prompts,
+            batch=args.batch,
+            think_tokens=args.think_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_new=args.max_new,
+            output_dir=Path(args.output),
+            row_limit=args.limit
         )
     except KeyboardInterrupt:
         print("Interrupted — partial results saved.")
