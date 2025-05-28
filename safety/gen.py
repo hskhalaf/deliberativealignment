@@ -129,13 +129,14 @@ def split_reasoning_answer(text: str):
 # ──────────────────────────────────────────────────────────────────────────
 # 4.  Data loading
 # ──────────────────────────────────────────────────────────────────────────
-def load_dataset(path: str = "prompts.json", seed: int = 42):
+def load_dataset(path: str = "prompts.json", limit: int = -1, seed: int = 42):
     data = json.loads(Path(path).read_text(encoding="utf‑8"))
     prompts = [d["prompt"] for d in data]
     conflicts = [d.get("conflict") for d in data]
     rng = random.Random(seed)
     shuff = list(zip(prompts, conflicts))
     rng.shuffle(shuff)
+    shuff = shuff[: limit]
     return [p for p, _ in shuff], [c for _, c in shuff]
 
 
@@ -203,6 +204,7 @@ async def run(
     top_p: float,
     max_new: int,
     output_dir: Path,
+    row_limit: int
 ):
     print(f"Loading model {model_name} …")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -213,13 +215,13 @@ async def run(
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map="auto",
         trust_remote_code=True,
-        attn_implementation="flash_attention_2",
+      #  attn_implementation="flash_attention_2",
     )
-    prompts, conflicts = load_dataset(prompts_path)
+    prompts, conflicts = load_dataset(prompts_path, limit=row_limit)
     template = PromptTemplate()
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    outfile = output_dir / f"{model_name.replace('/', '_')}.jsonl"
+    outfile = output_dir / f"{model_name.replace('/', '_')}1.jsonl"
 
     # Use a single ProcessPoolExecutor for CPU‑side tasks
     from concurrent.futures import ThreadPoolExecutor
@@ -268,6 +270,8 @@ def cli():
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--max-new", type=int, default=1500)
+    p.add_argument("--limit", type=int, default=-1,
+                   help="use at most this many rows from the dataset (-1 = all)")
     args = p.parse_args()
 
     try:
@@ -282,6 +286,7 @@ def cli():
                 top_p=args.top_p,
                 max_new=args.max_new,
                 output_dir=Path(args.output),
+                row_limit=args.limit
             )
         )
     except KeyboardInterrupt:
