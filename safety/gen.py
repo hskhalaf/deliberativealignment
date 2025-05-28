@@ -74,7 +74,6 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
         self.in_think = True  # Start in think mode since <think> is in prompt
         self.NINF = float("-inf")
         
-        print(f"DEBUG: Starting budget processor, max tokens: {max_thinking_tokens}")
 
     def _endswith(self, ids: List[int], suffix: List[int]) -> bool:
         return len(ids) >= len(suffix) and ids[-len(suffix) :] == suffix
@@ -85,17 +84,17 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
         ids = input_ids[0].tolist()
         
         if self.in_think:
-            print(f"DEBUG: Generation step {self.generation_step}/{self.max_tokens}")
+            # print(f"DEBUG: Generation step {self.generation_step}/{self.max_tokens}")
             
             # Check if we naturally hit </think>
             if self._endswith(ids, self.think_end):
-                print(f"DEBUG: Natural </think> found at step {self.generation_step}")
+                # print(f"DEBUG: Natural </think> found at step {self.generation_step}")
                 self.in_think = False
                 return scores
             
             # Check if we've hit our budget
             if self.generation_step >= self.max_tokens:
-                print(f"DEBUG: Hit budget at step {self.generation_step}, forcing </think>")
+                # print(f"DEBUG: Hit budget at step {self.generation_step}, forcing </think>")
                 scores[0].fill_(self.NINF)
                 
                 if not self._endswith(ids, [self.newline]):
@@ -118,13 +117,7 @@ _tag_re = re.compile(
 
 def split_reasoning_answer(text: str, tokenizer=None):
     """Split the generated text into reasoning and answer parts."""
-    
-    # Debug print
-    print(f"=== PARSING INPUT ===")
-    print(f"Text length: {len(text)}")
-    print(f"Contains </think>: {'</think>' in text}")
-    print(f"Contains <answer>: {'<answer>' in text}")
-    print(f"Contains </answer>: {'</answer>' in text}")
+
     
     reasoning = None
     answer = None
@@ -163,9 +156,7 @@ def split_reasoning_answer(text: str, tokenizer=None):
     
     reasoning_tokens = len(tokenizer.encode(reasoning)) if reasoning and tokenizer else 0
     answer_tokens = len(tokenizer.encode(answer)) if answer and tokenizer else 0
-    
-    print(f"Parsed - Reasoning: {len(reasoning) if reasoning else 0} chars, Answer: {len(answer) if answer else 0} chars")
-    print(f"Reasoning tokens: {reasoning_tokens}, Answer tokens: {answer_tokens}")
+
     
     return reasoning, answer, reasoning_tokens, answer_tokens
 
