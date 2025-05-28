@@ -1,6 +1,7 @@
 import argparse
 import json
 import random
+import math
 from pathlib import Path
 from typing import Any, List
 from datetime import datetime
@@ -49,128 +50,128 @@ class PromptTemplate:
         )
 
 # ──────────────────────────────────────────────────────────────────────────
-# 2.  Batched Thinking-token budget processor
+# 2.  Thinking Token Budget Processor
 # ──────────────────────────────────────────────────────────────────────────
-class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
+class ThinkingTokenBudgetProcessor(LogitsProcessor):
     """
-    Batched version that handles multiple sequences simultaneously.
-    Each sequence gets its own budget tracking.
+    LogitsProcessor that enforces a token budget for thinking sections.
     """
-
-    def __init__(self, tokenizer, max_thinking_tokens: int, batch_size: int):
-        super().__init__()
-        self.tok = tokenizer
-        self.max_tokens = max_thinking_tokens
-        self.batch_size = batch_size
-
-        # Tag tokens
-        self.think_end = tokenizer.encode("</think>", add_special_tokens=False)  
-        self.newline = tokenizer.encode("\n", add_special_tokens=False)[0]
-
-        # Runtime state per sequence - start all in think mode
-        self.in_think = [True] * batch_size
-        self.generation_steps = [0] * batch_size
+    
+    def __init__(
+        self, 
+        max_thinking_tokens: int,
+        think_end_token_ids: List[int],
+        newline_token_id: int,
+        padded_inputs: torch.Tensor  # Pass the actual padded inputs
+    ):
+        self.max_thinking_tokens = max_thinking_tokens
+        self.think_end_token_ids = torch.tensor(think_end_token_ids)
+        self.newline_token_id = newline_token_id
+        
+        # Calculate where thinking should end for each sequence
+        # Find the actual start of generation (after padding and prompt)
+        batch_size = padded_inputs.shape[0]
+        self.thinking_start_positions = []
+        
+        for i in range(batch_size):
+            # Find first non-pad token position for this sequence
+            sequence = padded_inputs[i]
+            non_pad_start = 0
+            for j, token_id in enumerate(sequence):
+                if token_id != 0:  # Assuming 0 is pad token
+                    non_pad_start = j
+                    break
+            
+            # The thinking starts right after the prompt (which ends with <think>)
+            prompt_end = len(sequence)  # Full length including prompt
+            self.thinking_start_positions.append(prompt_end)
+        
+        # Track state per sequence
+        self.thinking_token_counts = [0] * batch_size
+        self.in_thinking_mode = [True] * batch_size
         self.forcing_closure = [False] * batch_size
-        self.already_forced = [False] * batch_size  # Track if we already forced closure
-        self.call_count = 0  # Track total processor calls
-        self.NINF = float("-inf")
         
-        print(f"DEBUG: Batched processor initialized for {batch_size} sequences, max tokens: {max_thinking_tokens}")
-
-    def _endswith(self, ids: List[int], suffix: List[int]) -> bool:
-        return len(ids) >= len(suffix) and ids[-len(suffix) :] == suffix
-
-class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
-    """
-    Batched version that handles multiple sequences simultaneously.
-    Each sequence gets its own budget tracking.
-    """
-
-    def __init__(self, tokenizer, max_thinking_tokens: int, batch_size: int):
-        super().__init__()
-        self.tok = tokenizer
-        self.max_tokens = max_thinking_tokens
-        self.batch_size = batch_size
-
-        # Tag tokens
-        self.think_end = tokenizer.encode("</think>", add_special_tokens=False)  
-        self.newline = tokenizer.encode("\n", add_special_tokens=False)[0]
-
-        # Runtime state per sequence - start all in think mode
-        self.in_think = [True] * batch_size
-        self.generation_steps = [0] * batch_size
-        self.forcing_closure = [False] * batch_size
-        self.already_forced = [False] * batch_size  # Track if we already forced closure
-        self.call_count = 0  # Track total processor calls
-        self.NINF = float("-inf")
+        print(f"DEBUG: Thinking processor initialized - max tokens: {max_thinking_tokens}, batch size: {batch_size}")
+    
+    def _sequence_contains_think_end(self, sequence: torch.Tensor) -> bool:
+        """Check if sequence contains </think> tokens"""
+        if len(sequence) < len(self.think_end_token_ids):
+            return False
+            
+        # Look for think_end pattern in the sequence
+        for i in range(len(self.think_end_token_ids), len(sequence) + 1):
+            if torch.equal(
+                sequence[i-len(self.think_end_token_ids):i], 
+                self.think_end_token_ids
+            ):
+                return True
+        return False
+    
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        batch_size = input_ids.shape[0]
+        current_length = input_ids.shape[1]
         
-        print(f"DEBUG: Batched processor initialized for {batch_size} sequences, max tokens: {max_thinking_tokens}")
-
-    def _endswith(self, ids: List[int], suffix: List[int]) -> bool:
-        return len(ids) >= len(suffix) and ids[-len(suffix) :] == suffix
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
-        # Increment call count once at the start
-        self.call_count += 1
-        actual_batch_size = input_ids.shape[0]
+        # Early exit if no sequences are in thinking mode
+        if not any(self.in_thinking_mode):
+            return scores
         
-        # Early exit if all sequences finished thinking - FAST PATH
-        active_thinking = sum(1 for x in self.in_think if x)
-        if active_thinking == 0:
-            if self.call_count % 100 == 1:  # Occasional debug
-                print(f"DEBUG: All sequences finished thinking, processor idle (call #{self.call_count})")
-            return scores  # Return immediately - no expensive work!
-        
-        # EXPENSIVE WORK ONLY RUNS WHEN SEQUENCES ARE STILL THINKING
-        
-        # Debug info every 10 calls to verify batching
-        if self.call_count % 10 == 1:
-            print(f"DEBUG: Processor call #{self.call_count} - Processing {actual_batch_size} sequences simultaneously")
-            if actual_batch_size != self.batch_size:
-                print(f"WARNING: Expected batch size {self.batch_size}, got {actual_batch_size}")
-        
-        # Process each sequence in the batch
-        for batch_idx in range(actual_batch_size):
-            if batch_idx >= len(self.in_think):
+        # Process each sequence
+        for i in range(batch_size):
+            if not self.in_thinking_mode[i]:
                 continue
             
-            # Use generation steps instead of prompt lengths to avoid padding issues
-            self.generation_steps[batch_idx] += 1
-            ids = input_ids[batch_idx].tolist()
+            sequence = input_ids[i]
             
-            if self.in_think[batch_idx]:
-                # Check if we naturally hit </think>
-                if self._endswith(ids, self.think_end):
-                    if not self.already_forced[batch_idx]:
-                        print(f"DEBUG: Seq {batch_idx} - Natural </think> at step {self.generation_steps[batch_idx]} (call #{self.call_count})")
-                    else:
-                        print(f"DEBUG: Seq {batch_idx} - Forced </think> executed at step {self.generation_steps[batch_idx]} (call #{self.call_count})")
-                    self.in_think[batch_idx] = False
-                    self.forcing_closure[batch_idx] = False
-                    continue
+            # Check if this sequence naturally ended thinking
+            if self._sequence_contains_think_end(sequence):
+                self.in_thinking_mode[i] = False
+                self.forcing_closure[i] = False
+                print(f"DEBUG: Seq {i} - Natural </think> found (thinking tokens: {self.thinking_token_counts[i]})")
+                continue
+            
+            # Count thinking tokens (tokens generated after the initial prompt)
+            thinking_tokens = current_length - self.thinking_start_positions[i]
+            self.thinking_token_counts[i] = max(0, thinking_tokens)  # Don't go negative
+            
+            # Check if we need to force closure
+            if self.thinking_token_counts[i] >= self.max_thinking_tokens and not self.forcing_closure[i]:
+                print(f"DEBUG: Seq {i} - Hit thinking budget ({self.thinking_token_counts[i]}/{self.max_thinking_tokens}), forcing </think>")
+                self.forcing_closure[i] = True
+            
+            # Apply forced closure
+            if self.forcing_closure[i]:
+                scores[i] = torch.full_like(scores[i], -math.inf)
                 
-                # Check if we've hit our budget
-                if self.generation_steps[batch_idx] >= self.max_tokens and not self.forcing_closure[batch_idx]:
-                    print(f"DEBUG: Seq {batch_idx} - Hit budget at step {self.generation_steps[batch_idx]}, forcing </think> (call #{self.call_count})")
-                    self.forcing_closure[batch_idx] = True
-                    self.already_forced[batch_idx] = True
-                
-                # If we're forcing closure, manipulate the logits for this sequence
-                if self.forcing_closure[batch_idx]:
-                    scores[batch_idx].fill_(self.NINF)
-                    
-                    if not self._endswith(ids, [self.newline]):
-                        scores[batch_idx, self.newline] = 0.0
-                    else:
-                        scores[batch_idx, self.think_end[0]] = 0.0
+                # Force newline first, then </think>
+                if len(sequence) > 0 and sequence[-1] != self.newline_token_id:
+                    scores[i, self.newline_token_id] = 0.0
+                else:
+                    scores[i, self.think_end_token_ids[0]] = 0.0
         
-        # Summary every 50 calls
-        if self.call_count % 50 == 0:
-            finished_sequences = sum(1 for x in self.in_think[:actual_batch_size] if not x)
-            print(f"DEBUG: Call #{self.call_count} Summary - {finished_sequences}/{actual_batch_size} sequences finished thinking")
-
         return scores
 
+
+def create_thinking_budget_processor(
+    tokenizer, 
+    max_thinking_tokens: int, 
+    padded_inputs: torch.Tensor
+) -> ThinkingTokenBudgetProcessor:
+    """Create a thinking budget processor for the given batch."""
+    
+    # Get token IDs
+    think_end_tokens = tokenizer.encode("</think>", add_special_tokens=False)
+    newline_token = tokenizer.encode("\n", add_special_tokens=False)[0]
+    
+    return ThinkingTokenBudgetProcessor(
+        max_thinking_tokens=max_thinking_tokens,
+        think_end_token_ids=think_end_tokens,
+        newline_token_id=newline_token,
+        padded_inputs=padded_inputs
+    )
+
+# ──────────────────────────────────────────────────────────────────────────
+# 3. Text processing functions
+# ──────────────────────────────────────────────────────────────────────────
 def split_reasoning_answer(text: str, tokenizer=None):
     """Split the generated text into reasoning and answer parts."""
     reasoning = None
@@ -226,6 +227,9 @@ def load_dataset(path: str = "prompts.json", limit: int = -1, seed: int = 42):
         shuff = shuff[:limit]
     return [p for p, _ in shuff], [c for _, c in shuff]
 
+# ──────────────────────────────────────────────────────────────────────────
+# 4. Generation functions
+# ──────────────────────────────────────────────────────────────────────────
 def generate_batch_sync(
     model,
     tokenizer,
@@ -248,11 +252,14 @@ def generate_batch_sync(
         truncation=True,
         max_length=4096,
         add_special_tokens=False,
-    ).to(model.device)  # Use model.device
+    ).to(model.device)
     
-    # Create thinking budget processor
-    batch_size = len(questions)
-    processor = BatchedThinkingTokenBudgetProcessor(tokenizer, think_budget, batch_size)
+    # Create thinking budget processor with the actual padded inputs
+    processor = create_thinking_budget_processor(
+        tokenizer=tokenizer,
+        max_thinking_tokens=think_budget,
+        padded_inputs=inputs['input_ids']
+    )
     
     gen_cfg = GenerationConfig(
         do_sample=True,
@@ -269,7 +276,7 @@ def generate_batch_sync(
         outputs = model.generate(
             **inputs,
             generation_config=gen_cfg,
-            logits_processor=[processor],  # Add back the thinking budget processor
+            logits_processor=[processor],
             use_cache=True,
         )
 
