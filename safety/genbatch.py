@@ -65,7 +65,9 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
         padded_inputs: torch.Tensor  # Pass the actual padded inputs
     ):
         self.max_thinking_tokens = max_thinking_tokens
-        self.think_end_token_ids = torch.tensor(think_end_token_ids)
+        # Put tensors on the same device as the model inputs
+        device = padded_inputs.device
+        self.think_end_token_ids = torch.tensor(think_end_token_ids, device=device)
         self.newline_token_id = newline_token_id
         
         # Calculate where thinking should end for each sequence
@@ -100,10 +102,9 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
             
         # Look for think_end pattern in the sequence
         for i in range(len(self.think_end_token_ids), len(sequence) + 1):
-            if torch.equal(
-                sequence[i-len(self.think_end_token_ids):i], 
-                self.think_end_token_ids
-            ):
+            # Make sure both tensors are on the same device
+            sequence_slice = sequence[i-len(self.think_end_token_ids):i].to(self.think_end_token_ids.device)
+            if torch.equal(sequence_slice, self.think_end_token_ids):
                 return True
         return False
     
