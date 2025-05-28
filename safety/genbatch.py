@@ -84,7 +84,13 @@ class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
         # Increment call count and verify batch processing
         self.call_count += 1
         actual_batch_size = input_ids.shape[0]
-        
+        active_thinking = sum(1 for x in self.in_think if x)
+        if active_thinking == 0:
+            if self.call_count % 100 == 1:  # Occasional debug
+                print(f"DEBUG: All sequences finished thinking, processor idle (call #{self.call_count})")
+            self.call_count += 1
+            return scores 
+    
         # Debug info every 10 calls to verify batching
         if self.call_count % 10 == 1:
             print(f"DEBUG: Processor call #{self.call_count} - Processing {actual_batch_size} sequences simultaneously")
