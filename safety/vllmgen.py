@@ -61,12 +61,30 @@ openai_api_base = "http://localhost:8000/v1"
 client = OpenAI(api_key=openai_api_key, base_url=openai_api_base)
 
 def make_dataset():
+    # Load JSON or JSONL transparently
     with open("prompts.json", "r", encoding="utf-8") as f:
-        data = json.load(f)
-    prompts = [item["prompt"] for item in data]
-    conflicts = [item["conflict"] for item in data]
-    prompt_template = PromptTemplate()
-    return prompt_template, prompts, conflicts
+        first = f.read(1)
+        f.seek(0)
+        data = (
+            json.load(f)                           # regular JSON array
+            if first == "[" 
+            else [json.loads(line) for line in f]  # JSONL
+        )
+
+    good, skipped = [], 0
+    for item in data:
+        if "prompt" in item and "conflict" in item:
+            good.append(item)
+        else:
+            skipped += 1                           # count bad rows
+
+    if skipped:
+        print(f"[WARN] skipped {skipped} records lacking 'prompt' or 'conflict'")
+
+    prompts   = [it["prompt"]   for it in good]
+    conflicts = [it["conflict"] for it in good]
+    return PromptTemplate(), prompts, conflicts
+
 
 async def fetch_response(model, question, conflict, prompt_template, timeout=300):
     n_generation = 10
