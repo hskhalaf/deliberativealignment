@@ -168,7 +168,6 @@ async def generate_one(
         top_p=top_p,
         max_new_tokens=max_new,
         num_return_sequences=n,
-        logits_processor=[processor],
         pad_token_id=tokenizer.eos_token_id,
     )
 
@@ -178,7 +177,7 @@ async def generate_one(
         outputs = await asyncio.wait_for(
             loop.run_in_executor(
                 executor,
-                lambda: model.generate(**inputs, generation_config=gen_cfg),
+                lambda: model.generate(**inputs, generation_config=gen_cfg, logits_processor=[processor],),
             ),
             timeout=timeout,
         )
