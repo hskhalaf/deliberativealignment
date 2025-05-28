@@ -80,26 +80,56 @@ class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
     def _endswith(self, ids: List[int], suffix: List[int]) -> bool:
         return len(ids) >= len(suffix) and ids[-len(suffix) :] == suffix
 
+class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
+    """
+    Batched version that handles multiple sequences simultaneously.
+    Each sequence gets its own budget tracking.
+    """
+
+    def __init__(self, tokenizer, max_thinking_tokens: int, batch_size: int):
+        super().__init__()
+        self.tok = tokenizer
+        self.max_tokens = max_thinking_tokens
+        self.batch_size = batch_size
+
+        # Tag tokens
+        self.think_end = tokenizer.encode("</think>", add_special_tokens=False)  
+        self.newline = tokenizer.encode("\n", add_special_tokens=False)[0]
+
+        # Runtime state per sequence - start all in think mode
+        self.in_think = [True] * batch_size
+        self.generation_steps = [0] * batch_size
+        self.forcing_closure = [False] * batch_size
+        self.already_forced = [False] * batch_size  # Track if we already forced closure
+        self.call_count = 0  # Track total processor calls
+        self.NINF = float("-inf")
+        
+        print(f"DEBUG: Batched processor initialized for {batch_size} sequences, max tokens: {max_thinking_tokens}")
+
+    def _endswith(self, ids: List[int], suffix: List[int]) -> bool:
+        return len(ids) >= len(suffix) and ids[-len(suffix) :] == suffix
+
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
-        # Increment call count and verify batch processing
+        # Increment call count once at the start
         self.call_count += 1
         actual_batch_size = input_ids.shape[0]
+        
+        # Early exit if all sequences finished thinking - FAST PATH
         active_thinking = sum(1 for x in self.in_think if x)
         if active_thinking == 0:
             if self.call_count % 100 == 1:  # Occasional debug
                 print(f"DEBUG: All sequences finished thinking, processor idle (call #{self.call_count})")
-            self.call_count += 1
-            return scores 
-    
+            return scores  # Return immediately - no expensive work!
+        
+        # EXPENSIVE WORK ONLY RUNS WHEN SEQUENCES ARE STILL THINKING
+        
         # Debug info every 10 calls to verify batching
         if self.call_count % 10 == 1:
             print(f"DEBUG: Processor call #{self.call_count} - Processing {actual_batch_size} sequences simultaneously")
             if actual_batch_size != self.batch_size:
                 print(f"WARNING: Expected batch size {self.batch_size}, got {actual_batch_size}")
         
-        # Track active sequences (still thinking)
-        active_sequences = sum(1 for i in range(actual_batch_size) if i < len(self.in_think) and self.in_think[i])
-        
+        # Process each sequence in the batch
         for batch_idx in range(actual_batch_size):
             if batch_idx >= len(self.in_think):
                 continue
