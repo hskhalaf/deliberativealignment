@@ -71,6 +71,8 @@ class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
         self.in_think = [True] * batch_size
         self.generation_steps = [0] * batch_size
         self.forcing_closure = [False] * batch_size
+        self.already_forced = [False] * batch_size  # Track if we already forced closure
+        self.call_count = 0  # Track total processor calls
         self.NINF = float("-inf")
         
         print(f"DEBUG: Batched processor initialized for {batch_size} sequences, max tokens: {max_thinking_tokens}")
@@ -79,9 +81,20 @@ class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
         return len(ids) >= len(suffix) and ids[-len(suffix) :] == suffix
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
-        batch_size = input_ids.shape[0]
+        # Increment call count and verify batch processing
+        self.call_count += 1
+        actual_batch_size = input_ids.shape[0]
         
-        for batch_idx in range(batch_size):
+        # Debug info every 10 calls to verify batching
+        if self.call_count % 10 == 1:
+            print(f"DEBUG: Processor call #{self.call_count} - Processing {actual_batch_size} sequences simultaneously")
+            if actual_batch_size != self.batch_size:
+                print(f"WARNING: Expected batch size {self.batch_size}, got {actual_batch_size}")
+        
+        # Track active sequences (still thinking)
+        active_sequences = sum(1 for i in range(actual_batch_size) if i < len(self.in_think) and self.in_think[i])
+        
+        for batch_idx in range(actual_batch_size):
             if batch_idx >= len(self.in_think):
                 continue
             
@@ -92,15 +105,19 @@ class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
             if self.in_think[batch_idx]:
                 # Check if we naturally hit </think>
                 if self._endswith(ids, self.think_end):
-                    print(f"DEBUG: Batch {batch_idx} - Natural </think> found at step {self.generation_steps[batch_idx]}")
+                    if not self.already_forced[batch_idx]:
+                        print(f"DEBUG: Seq {batch_idx} - Natural </think> at step {self.generation_steps[batch_idx]} (call #{self.call_count})")
+                    else:
+                        print(f"DEBUG: Seq {batch_idx} - Forced </think> executed at step {self.generation_steps[batch_idx]} (call #{self.call_count})")
                     self.in_think[batch_idx] = False
                     self.forcing_closure[batch_idx] = False
                     continue
                 
                 # Check if we've hit our budget
                 if self.generation_steps[batch_idx] >= self.max_tokens and not self.forcing_closure[batch_idx]:
-                    print(f"DEBUG: Batch {batch_idx} - Hit budget at step {self.generation_steps[batch_idx]}, forcing </think>")
+                    print(f"DEBUG: Seq {batch_idx} - Hit budget at step {self.generation_steps[batch_idx]}, forcing </think> (call #{self.call_count})")
                     self.forcing_closure[batch_idx] = True
+                    self.already_forced[batch_idx] = True
                 
                 # If we're forcing closure, manipulate the logits for this sequence
                 if self.forcing_closure[batch_idx]:
@@ -110,6 +127,11 @@ class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
                         scores[batch_idx, self.newline] = 0.0
                     else:
                         scores[batch_idx, self.think_end[0]] = 0.0
+        
+        # Summary every 50 calls
+        if self.call_count % 50 == 0:
+            finished_sequences = sum(1 for x in self.in_think[:actual_batch_size] if not x)
+            print(f"DEBUG: Call #{self.call_count} Summary - {finished_sequences}/{actual_batch_size} sequences finished thinking")
 
         return scores
 
