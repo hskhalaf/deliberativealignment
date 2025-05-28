@@ -37,7 +37,7 @@ class PromptTemplate:
         "{solution}\n"
         "{answer_end_tag}\n\n"
         "User: {question}\n"
-        "Assistant:"
+        "Assistant: <think>\n"
     )
 
     def generate(self, question: str) -> str:
@@ -128,25 +128,25 @@ class BatchedThinkingTokenBudgetProcessor(LogitsProcessor):
 # ──────────────────────────────────────────────────────────────────────────
 # 3.  Utility: split reasoning / answer (unchanged)
 # ──────────────────────────────────────────────────────────────────────────
-_tag_re = re.compile(
-    r"<think>(.*?)</think>.*?<answer>(.*?)</answer>",
-    flags=re.DOTALL | re.IGNORECASE,
-)
 
 def split_reasoning_answer(text: str, tokenizer=None):
     """Split the generated text into reasoning and answer parts."""
     reasoning = None
     answer = None
     
-    # Since <think> is in the prompt, we need to extract everything before </think>
+    # Now that <think> is in the prompt, the generated text should start with reasoning content
     if "</think>" in text:
         think_end = text.find("</think>")
-        reasoning = text[:think_end].strip()
+        # If text starts with <think>, remove it; otherwise extract everything before </think>
+        if text.startswith("<think>"):
+            reasoning = text[7:think_end].strip()  # Remove <think> and extract content
+        else:
+            reasoning = text[:think_end].strip()
         
-        # The rest of the text after </think>
-        remaining_text = text[think_end + 8:].strip()  # +8 for len("</think>")
+        # The rest after </think>
+        remaining_text = text[think_end + 8:].strip()
         
-        # Extract answer from remaining text
+        # Extract answer
         if "<answer>" in remaining_text:
             answer_start = remaining_text.find("<answer>")
             answer_end = remaining_text.find("</answer>")
@@ -157,7 +157,7 @@ def split_reasoning_answer(text: str, tokenizer=None):
         else:
             answer = remaining_text.strip()
     else:
-        # Fallback: if no </think> found, check for <answer> tags
+        # Fallback if no </think> found
         if "<answer>" in text:
             answer_start = text.find("<answer>")
             answer_end = text.find("</answer>")
@@ -172,7 +172,6 @@ def split_reasoning_answer(text: str, tokenizer=None):
     answer_tokens = len(tokenizer.encode(answer)) if answer and tokenizer else 0
     
     return reasoning, answer, reasoning_tokens, answer_tokens
-
 
 # ──────────────────────────────────────────────────────────────────────────
 # 4.  Data loading (unchanged)
@@ -272,10 +271,17 @@ async def generate_batch(
     # Process results for each sequence in the batch
     results = []
     for i, (question, conflict) in enumerate(zip(questions, conflicts)):
-        # Extract generated text for this sequence
-        prompt_length = prompt_lengths[i]
-        generated_tokens = outputs[i][prompt_length:]
-        new_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        # FIXED: Decode full sequence and use string splitting
+        full_text = tokenizer.decode(outputs[i], skip_special_tokens=True)
+        
+        # Extract only the generated part after "Assistant: <think>"
+        if "Assistant: <think>" in full_text:
+            new_text = full_text.split("Assistant: <think>", 1)[1]
+            # Prepend the opening tag since split removed it
+            new_text = "<think>" + new_text
+        else:
+            # Fallback for edge cases
+            new_text = full_text
         
         reasoning, answer, reasoning_tokens, response_tokens = split_reasoning_answer(new_text, tokenizer)
         results.append(dict(
@@ -286,8 +292,6 @@ async def generate_batch(
             reasoning_tokens=reasoning_tokens,
             response_tokens=response_tokens
         ))
-    
-    return results
 
 
 # ──────────────────────────────────────────────────────────────────────────
