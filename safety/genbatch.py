@@ -62,15 +62,20 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
         max_thinking_tokens: int,
         think_end_token_ids: List[int],
         newline_token_id: int,
-        initial_input_length: int  # Length of the padded inputs when generation starts
+        initial_input_length: int,  # Length of the padded inputs when generation starts
+        batch_size: int
     ):
         self.max_thinking_tokens = max_thinking_tokens
         self.think_end_token_ids = torch.tensor(think_end_token_ids)
         self.newline_token_id = newline_token_id
-        self.initial_input_length = initial_input_length  # This is the baseline
+        self.initial_input_length = initial_input_length
+        
+        # Track which sequences have finished thinking
+        self.finished_thinking = [False] * batch_size
         
         print(f"DEBUG: Thinking processor initialized - max tokens: {max_thinking_tokens}")
         print(f"DEBUG: Initial input length: {initial_input_length}")
+        print(f"DEBUG: Batch size: {batch_size}")
     
     def _sequence_contains_think_end(self, sequence: torch.Tensor) -> bool:
         """Check if sequence contains </think> tokens"""
@@ -99,18 +104,23 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
         if self.call_count <= 5:
             print(f"DEBUG: Call #{self.call_count} - current_length: {current_length}, initial: {self.initial_input_length}, generated: {tokens_generated}")
         
-        # Early exit if no tokens generated yet
-        if tokens_generated <= 0:
+        # Early exit if all sequences finished thinking
+        if all(self.finished_thinking):
             return scores
         
         # Process each sequence
         for i in range(batch_size):
+            # Skip sequences that already finished thinking
+            if self.finished_thinking[i]:
+                continue
+                
             sequence = input_ids[i]
             
             # Check if this sequence naturally ended thinking
             if self._sequence_contains_think_end(sequence):
+                self.finished_thinking[i] = True  # Mark as finished
                 if self.call_count % 20 == 0:  # Less frequent debug
-                    print(f"DEBUG: Seq {i} - Natural </think> found (tokens generated: {tokens_generated})")
+                    print(f"DEBUG: Seq {i} - Natural </think> found (tokens generated: {tokens_generated}) - FINISHED")
                 continue
             
             # Check if we need to force closure
@@ -143,12 +153,14 @@ def create_thinking_budget_processor(
     
     # The key fix: use the current length of padded inputs as baseline
     initial_input_length = padded_inputs.shape[1]
+    batch_size = padded_inputs.shape[0]
     
     return ThinkingTokenBudgetProcessor(
         max_thinking_tokens=max_thinking_tokens,
         think_end_token_ids=think_end_tokens,
         newline_token_id=newline_token,
-        initial_input_length=initial_input_length  # All sequences use same baseline
+        initial_input_length=initial_input_length,
+        batch_size=batch_size
     )
 
 # ──────────────────────────────────────────────────────────────────────────
