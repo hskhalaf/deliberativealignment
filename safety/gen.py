@@ -126,56 +126,50 @@ def split_reasoning_answer(text: str, tokenizer=None):
     # Debug print
     print(f"=== PARSING INPUT ===")
     print(f"Text length: {len(text)}")
-    print(f"Contains <think>: {'<think>' in text}")
     print(f"Contains </think>: {'</think>' in text}")
     print(f"Contains <answer>: {'<answer>' in text}")
     print(f"Contains </answer>: {'</answer>' in text}")
     
-    # Try the original regex first
-    m = _tag_re.search(text)
-    if m:
-        print("Regex match found!")
-        reasoning = m.group(1).strip()
-        answer = m.group(2).strip()
-        reasoning_tokens = len(tokenizer.encode(reasoning)) if reasoning and tokenizer else 0
-        answer_tokens = len(tokenizer.encode(answer)) if answer and tokenizer else 0
-        return reasoning, answer, reasoning_tokens, answer_tokens
-    
-    print("No regex match, trying manual parsing...")
-    
-    # Manual parsing as fallback
     reasoning = None
     answer = None
     
-    # Extract thinking section
-    if "<think>" in text:
-        think_start = text.find("<think>")
+    # Since <think> is in the prompt, we need to extract everything before </think>
+    if "</think>" in text:
         think_end = text.find("</think>")
-        if think_end > think_start:
-            reasoning = text[think_start + 7:think_end].strip()
+        reasoning = text[:think_end].strip()
+        
+        # The rest of the text after </think>
+        remaining_text = text[think_end + 8:].strip()  # +8 for len("</think>")
+        
+        # Extract answer from remaining text
+        if "<answer>" in remaining_text:
+            answer_start = remaining_text.find("<answer>")
+            answer_end = remaining_text.find("</answer>")
+            if answer_end > answer_start:
+                answer = remaining_text[answer_start + 8:answer_end].strip()  # +8 for len("<answer>")
+            else:
+                answer = remaining_text[answer_start + 8:].strip()
         else:
-            # Handle case where </think> is missing
-            reasoning = text[think_start + 7:].strip()
-            # Try to find where reasoning likely ends (before <answer> or at reasonable length)
-            if "<answer>" in reasoning:
-                reasoning = reasoning[:reasoning.find("<answer>")].strip()
-    
-    # Extract answer section  
-    if "<answer>" in text:
-        answer_start = text.find("<answer>")
-        answer_end = text.find("</answer>")
-        if answer_end > answer_start:
-            answer = text[answer_start + 8:answer_end].strip()
+            # If no <answer> tag, treat remaining text as answer
+            answer = remaining_text.strip()
+    else:
+        # Fallback: if no </think> found, check for <answer> tags
+        if "<answer>" in text:
+            answer_start = text.find("<answer>")
+            answer_end = text.find("</answer>")
+            if answer_end > answer_start:
+                answer = text[answer_start + 8:answer_end].strip()
+            else:
+                answer = text[answer_start + 8:].strip()
         else:
-            answer = text[answer_start + 8:].strip()
-    elif reasoning is None:
-        # If no tags found at all, treat the whole text as answer
-        answer = text.strip()
+            # Last resort: treat entire text as answer
+            answer = text.strip()
     
     reasoning_tokens = len(tokenizer.encode(reasoning)) if reasoning and tokenizer else 0
     answer_tokens = len(tokenizer.encode(answer)) if answer and tokenizer else 0
     
     print(f"Parsed - Reasoning: {len(reasoning) if reasoning else 0} chars, Answer: {len(answer) if answer else 0} chars")
+    print(f"Reasoning tokens: {reasoning_tokens}, Answer tokens: {answer_tokens}")
     
     return reasoning, answer, reasoning_tokens, answer_tokens
 
