@@ -211,6 +211,9 @@ def split_reasoning_answer(text: str, tokenizer=None):
                 answer = answer_content[:answer_end].strip()
             else:
                 answer = answer_content.strip()
+        else:
+            # No <answer> tag found in remaining text, treat it as answer
+            answer = remaining_text
         
     elif "</think>" in text:
         # Only reasoning, no answer section
@@ -219,10 +222,27 @@ def split_reasoning_answer(text: str, tokenizer=None):
             reasoning = text[7:think_end].strip()
         else:
             reasoning = text[:think_end].strip()
-        answer = "No answer provided."
+        
+        # Check if there's text after </think> that could be the answer
+        remaining_text = text[think_end + 8:].strip()
+        if remaining_text:
+            # There's text after </think>, treat it as answer even without <answer> tags
+            answer = remaining_text
+        else:
+            answer = "No answer provided."
         
     elif "<answer>" in text:
-        # Only answer, no reasoning
+        # Only answer, no proper reasoning section
+        # Check if there's a <think> without </think>
+        if "<think>" in text:
+            think_start = text.find("<think>")
+            answer_start = text.find("<answer>")
+            # Extract reasoning between <think> and <answer>
+            reasoning = text[think_start + 7:answer_start].strip()
+        else:
+            reasoning = "No reasoning provided."
+        
+        # Extract answer
         answer_start = text.find("<answer>")
         answer_content = text[answer_start + 8:]
         answer_end = answer_content.find("</answer>")
@@ -230,17 +250,27 @@ def split_reasoning_answer(text: str, tokenizer=None):
             answer = answer_content[:answer_end].strip()
         else:
             answer = answer_content.strip()
-        reasoning = "No reasoning provided."
+        
+    elif "<think>" in text:
+        # Has <think> but no </think> - likely hit token limit
+        think_start = text.find("<think>")
+        content_after_think = text[think_start + 7:].strip()
+        
+        # The entire content after <think> is reasoning since there's no </think>
+        reasoning = content_after_think
+        answer = "No answer provided (thinking was cut off)."
         
     else:
         # No tags found - treat as raw response
         reasoning = "No reasoning provided."
         answer = text.strip()
     
+    # Calculate token counts
     reasoning_tokens = len(tokenizer.encode(reasoning)) if reasoning and tokenizer else 0
     answer_tokens = len(tokenizer.encode(answer)) if answer and tokenizer else 0
     
-    print(f"DEBUG: Parsed - reasoning: {len(reasoning or '')} chars, answer: {len(answer or '')} chars")
+    print(f"DEBUG: Parsed - reasoning: {len(reasoning or '')} chars ({reasoning_tokens} tokens), " +
+          f"answer: {len(answer or '')} chars ({answer_tokens} tokens)")
     
     return reasoning, answer, reasoning_tokens, answer_tokens
 
@@ -282,6 +312,9 @@ def generate_batch_sync(
         add_special_tokens=False,
     ).to(model.device)
     
+    # Store original input lengths for each sequence
+    input_lengths = [len(ids[ids != tokenizer.pad_token_id]) for ids in inputs['input_ids']]
+    
     # Create thinking budget processor with the actual padded inputs
     processor = create_thinking_budget_processor(
         tokenizer=tokenizer,
@@ -311,22 +344,29 @@ def generate_batch_sync(
     # Process results
     results = []
     for i, (question, conflict) in enumerate(zip(questions, conflicts)):
-        full_text = tokenizer.decode(outputs[i], skip_special_tokens=True)
+        # Get the generated tokens only (exclude input)
+        output_seq = outputs[i]
+        input_len = input_lengths[i]
         
-        # FIXED: Extract generated content properly
-        if "Assistant: <think>" in full_text:
-            # Split and keep the generated part
-            generated_part = full_text.split("Assistant: <think>", 1)[1]
-            new_text = "<think>" + generated_part
-        else:
-            # Fallback
-            new_text = full_text
+        # Decode only the generated part
+        generated_ids = output_seq[input_len:]
+        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
         
-        reasoning, answer, reasoning_tokens, response_tokens = split_reasoning_answer(new_text, tokenizer)
+        print(f"\nDEBUG: Sample {i+1}/{len(questions)}")
+        print(f"DEBUG: Input length: {input_len} tokens")
+        print(f"DEBUG: Total output length: {len(output_seq)} tokens")
+        print(f"DEBUG: Generated length: {len(generated_ids)} tokens")
+        print(f"DEBUG: Generated text preview: {repr(generated_text[:200])}")
+        
+        # Process the generated text
+        reasoning, answer, reasoning_tokens, response_tokens = split_reasoning_answer(
+            generated_text, tokenizer
+        )
+        
         results.append(dict(
             question=question,
-            response=answer,  # This should be the clean answer now
-            reasoning=reasoning,  # This should be the thinking content
+            response=answer,
+            reasoning=reasoning,
             conflict=conflict,
             reasoning_tokens=reasoning_tokens,
             response_tokens=response_tokens
