@@ -4,6 +4,8 @@ from openai import OpenAI
 import os
 import random
 from pathlib import Path
+from datetime import datetime
+
 random.seed(42) 
 
 # Fix: Use pathlib.Path correctly and fix variable name
@@ -83,11 +85,13 @@ def make_dataset():
 
     prompts   = [it["prompt"]   for it in good]
     conflicts = [it["conflict"] for it in good]
+    
+    print(f"[INFO] Loaded {len(good)} valid prompts")
     return PromptTemplate(), prompts, conflicts
 
 
 async def fetch_response(model, question, conflict, prompt_template, timeout=300):
-    n_generation = 10
+    n_generation = 10  # Keep 10 generations as requested
     temp = 0.6
     top_p = 0.95
     max_tokens = 32768
@@ -95,7 +99,9 @@ async def fetch_response(model, question, conflict, prompt_template, timeout=300
     formatted_prompt = prompt_template.generate_code_prompt(question)
     messages = [{"role": "user", "content": formatted_prompt}]
     loop = asyncio.get_running_loop()
+    
     try:
+        print(f"[DEBUG] Sending request for question: {question[:50]}...")
         response = await asyncio.wait_for(loop.run_in_executor(None, lambda: client.chat.completions.create(
             model=model, 
             messages=messages, 
@@ -104,41 +110,92 @@ async def fetch_response(model, question, conflict, prompt_template, timeout=300
             top_p=top_p, 
             max_tokens=max_tokens,
         )), timeout)
-        msg = response.choices[0].message
-        if hasattr(msg, "reasoning_content"):
-            reasoning_content = msg.reasoning_content
-        else:
-            reasoning_content = None
-        content = msg.content
+        
+        # Collect all responses and reasoning from all choices
+        responses = []
+        reasonings = []
+        
+        for choice in response.choices:
+            msg = choice.message
+            responses.append(msg.content)
+            
+            if hasattr(msg, "reasoning_content"):
+                reasonings.append(msg.reasoning_content)
+            else:
+                reasonings.append(None)
+        
+        print(f"[DEBUG] Received {len(responses)} responses for question: {question[:50]}...")
+        
     except asyncio.TimeoutError:
-        reasoning_content = None
-        content = None
+        print(f"[ERROR] Timeout for question: {question[:50]}...")
+        responses = [None] * n_generation
+        reasonings = [None] * n_generation
+    except Exception as e:
+        print(f"[ERROR] Exception for question: {question[:50]}... Error: {e}")
+        responses = [None] * n_generation
+        reasonings = [None] * n_generation
     
     return {
         "question": question,
-        "response": content,
-        "reasoning": reasoning_content,
+        "responses": responses,  # Now a list of all responses
+        "reasonings": reasonings,  # Now a list of all reasoning content
         "conflict": conflict,
     }
 
 async def main():
-    models = client.models.list()
-    model = models.data[0].id
-    prompt_template, questions, conflicts = make_dataset()
-    batch_size = 64
-    
-    # Ensure output directory exists
-    os.makedirs("safetyresults", exist_ok=True)
-    
-    for i in range(0, len(questions), batch_size):
-        batched_question = questions[i:i+batch_size]
-        batched_conflicts = conflicts[i:i+batch_size]
-        tasks = [fetch_response(model, q, c, prompt_template) for q, c in zip(batched_question, batched_conflicts)]
-        batch_results = await asyncio.gather(*tasks)
+    try:
+        models = client.models.list()
+        model = models.data[0].id
+        print(f"[INFO] Using model: {model}")
+        
+        prompt_template, questions, conflicts = make_dataset()
+        batch_size = 8  # Reduced batch size to avoid overwhelming the server
+        
+        os.makedirs("safetyresults", exist_ok=True)
+        
+        # Create timestamped filename instead of appending
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = f"safetyresults/{model.lower()}_{timestamp}.jsonl"
+        print(f"[INFO] Will write results to: {output_file}")
+        
+        total_processed = 0
+        
+        for i in range(0, len(questions), batch_size):
+            print(f"[INFO] Processing batch {i//batch_size + 1}/{(len(questions)-1)//batch_size + 1}")
+            
+            batched_question = questions[i:i+batch_size]
+            batched_conflicts = conflicts[i:i+batch_size]
+            tasks = [fetch_response(model, q, c, prompt_template) for q, c in zip(batched_question, batched_conflicts)]
+            batch_results = await asyncio.gather(*tasks)
 
-        with open(f"safetyresults/{model.lower()}.jsonl", "a+") as f:
-            for item in batch_results:
-                f.write(json.dumps(item) + "\n")
+            # Write batch results immediately
+            with open(output_file, "a", encoding="utf-8") as f:
+                for item in batch_results:
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    total_processed += 1
+            
+            print(f"[INFO] Batch completed. Total processed: {total_processed}")
+            
+            # Add small delay between batches to avoid overwhelming the server
+            await asyncio.sleep(1)
+        
+        print(f"[INFO] All processing complete. Total items: {total_processed}")
+        print(f"[INFO] Results saved to: {output_file}")
+        
+        # Verify file was written
+        if os.path.exists(output_file):
+            file_size = os.path.getsize(output_file)
+            print(f"[INFO] Output file size: {file_size} bytes")
+            with open(output_file, "r", encoding="utf-8") as f:
+                line_count = sum(1 for _ in f)
+            print(f"[INFO] Output file contains {line_count} lines")
+        else:
+            print(f"[ERROR] Output file was not created: {output_file}")
+            
+    except Exception as e:
+        print(f"[ERROR] Main function failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     asyncio.run(main())
