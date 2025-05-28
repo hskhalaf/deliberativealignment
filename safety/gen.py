@@ -57,10 +57,8 @@ class PromptTemplate:
 # ──────────────────────────────────────────────────────────────────────────
 class ThinkingTokenBudgetProcessor(LogitsProcessor):
     """
-    After at most `max_thinking_tokens` are generated *inside* a <think> …
-    block, force generation of </think> and let decoding continue.
-    One instance is meant for **one** `.generate()` call – recreate it every
-    time so counters reset cleanly.
+    Alternative approach: Track how many generation steps we've taken
+    instead of comparing absolute token positions
     """
 
     def __init__(self, tokenizer, max_thinking_tokens: int):
@@ -68,46 +66,44 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
         self.tok = tokenizer
         self.max_tokens = max_thinking_tokens
 
-        # Tag tokens can be multi‑token pieces ➜ store full sequences
-        self.think_start = tokenizer.encode("<think>", add_special_tokens=False)
         self.think_end = tokenizer.encode("</think>", add_special_tokens=False)
         self.newline = tokenizer.encode("\n", add_special_tokens=False)[0]
 
-        # Runtime state
-        self.in_think = False
-        self.tokens_in_think = 0
+        # Track generation steps instead of absolute positions
+        self.generation_step = 0
+        self.in_think = True  # Start in think mode since <think> is in prompt
         self.NINF = float("-inf")
+        
+        print(f"DEBUG: Starting budget processor, max tokens: {max_thinking_tokens}")
 
-    # Helper
     def _endswith(self, ids: List[int], suffix: List[int]) -> bool:
         return len(ids) >= len(suffix) and ids[-len(suffix) :] == suffix
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
-        # Batch size is 1 in this script.  Extend if you want batching.
+        # Each call to this method represents one generation step
+        self.generation_step += 1
         ids = input_ids[0].tolist()
-
-        # Detect the *start* of a reasoning block
-        if not self.in_think and self._endswith(ids, self.think_start):
-            self.in_think = True
-            self.tokens_in_think = 0
-            return scores
-
+        
         if self.in_think:
-            self.tokens_in_think += 1
-
-            # Once limit is reached, slam all logits to -inf except newline OR </think>
-            if self.tokens_in_think >= self.max_tokens:
+            print(f"DEBUG: Generation step {self.generation_step}/{self.max_tokens}")
+            
+            # Check if we naturally hit </think>
+            if self._endswith(ids, self.think_end):
+                print(f"DEBUG: Natural </think> found at step {self.generation_step}")
+                self.in_think = False
+                return scores
+            
+            # Check if we've hit our budget
+            if self.generation_step >= self.max_tokens:
+                print(f"DEBUG: Hit budget at step {self.generation_step}, forcing </think>")
                 scores[0].fill_(self.NINF)
-
-                # First force a newline to finish current word nicely,
-                # then on the very next step inject </think>
+                
                 if not self._endswith(ids, [self.newline]):
                     scores[0, self.newline] = 0.0
                 else:
                     scores[0, self.think_end[0]] = 0.0
-                    # After first token of "</think>" we're outside thinking
                     self.in_think = False
-
+        
         return scores
 
 
