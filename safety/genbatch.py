@@ -50,7 +50,7 @@ class PromptTemplate:
         )
 
 # ──────────────────────────────────────────────────────────────────────────
-# 2.  Thinking Token Budget Processor
+# 2.  FIXED Thinking Token Budget Processor
 # ──────────────────────────────────────────────────────────────────────────
 class ThinkingTokenBudgetProcessor(LogitsProcessor):
     """
@@ -62,50 +62,58 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
         max_thinking_tokens: int,
         think_end_token_ids: List[int],
         newline_token_id: int,
-        initial_input_length: int,  # Length of the padded inputs when generation starts
-        batch_size: int
+        initial_input_length: int,
+        batch_size: int,
+        device: torch.device
     ):
         self.max_thinking_tokens = max_thinking_tokens
-        self.think_end_token_ids = torch.tensor(think_end_token_ids)
+        self.think_end_token_ids = torch.tensor(think_end_token_ids, device=device)
         self.newline_token_id = newline_token_id
         self.initial_input_length = initial_input_length
         
         # Track which sequences have finished thinking
         self.finished_thinking = [False] * batch_size
+        self.call_count = 0
         
-        print(f"DEBUG: Thinking processor initialized - max tokens: {max_thinking_tokens}")
+        print(f"DEBUG: Thinking processor initialized")
+        print(f"DEBUG: Max tokens: {max_thinking_tokens}")
         print(f"DEBUG: Initial input length: {initial_input_length}")
+        print(f"DEBUG: Think end tokens: {think_end_token_ids}")
         print(f"DEBUG: Batch size: {batch_size}")
     
     def _sequence_contains_think_end(self, sequence: torch.Tensor) -> bool:
         """Check if sequence contains </think> tokens"""
-        if len(sequence) < len(self.think_end_token_ids):
+        think_end_len = len(self.think_end_token_ids)
+        if len(sequence) < think_end_len:
             return False
             
         # Look for think_end pattern in the sequence
-        for i in range(len(self.think_end_token_ids), len(sequence) + 1):
-            sequence_slice = sequence[i-len(self.think_end_token_ids):i].to(self.think_end_token_ids.device)
-            if torch.equal(sequence_slice, self.think_end_token_ids):
+        sequence = sequence.to(self.think_end_token_ids.device)
+        for i in range(think_end_len, len(sequence) + 1):
+            if torch.equal(sequence[i-think_end_len:i], self.think_end_token_ids):
                 return True
         return False
     
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        self.call_count += 1
         batch_size = input_ids.shape[0]
         current_length = input_ids.shape[1]
         
-        # Calculate how many tokens have been generated since the start
+        # Calculate how many tokens have been generated
         tokens_generated = current_length - self.initial_input_length
         
-        # Debug on first few calls
-        if not hasattr(self, 'call_count'):
-            self.call_count = 0
-        self.call_count += 1
-        
-        if self.call_count <= 5:
-            print(f"DEBUG: Call #{self.call_count} - current_length: {current_length}, initial: {self.initial_input_length}, generated: {tokens_generated}")
+        # Debug first few calls
+        if self.call_count <= 3:
+            print(f"DEBUG: Call #{self.call_count} - length: {current_length}, generated: {tokens_generated}")
         
         # Early exit if all sequences finished thinking
         if all(self.finished_thinking):
+            if self.call_count % 100 == 1:
+                print(f"DEBUG: All sequences finished thinking (call #{self.call_count})")
+            return scores
+        
+        # Early exit if no tokens generated yet
+        if tokens_generated <= 0:
             return scores
         
         # Process each sequence
@@ -118,15 +126,13 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
             
             # Check if this sequence naturally ended thinking
             if self._sequence_contains_think_end(sequence):
-                self.finished_thinking[i] = True  # Mark as finished
-                if self.call_count % 20 == 0:  # Less frequent debug
-                    print(f"DEBUG: Seq {i} - Natural </think> found (tokens generated: {tokens_generated}) - FINISHED")
+                self.finished_thinking[i] = True
+                print(f"DEBUG: Seq {i} - Natural </think> found at {tokens_generated} tokens - FINISHED")
                 continue
             
             # Check if we need to force closure
             if tokens_generated >= self.max_thinking_tokens:
-                if self.call_count % 20 == 0:
-                    print(f"DEBUG: Seq {i} - Hit thinking budget ({tokens_generated}/{self.max_thinking_tokens}), forcing </think>")
+                print(f"DEBUG: Seq {i} - Hit budget ({tokens_generated}/{self.max_thinking_tokens}), forcing </think>")
                 
                 # Apply forced closure
                 scores[i] = torch.full_like(scores[i], -math.inf)
@@ -151,62 +157,82 @@ def create_thinking_budget_processor(
     think_end_tokens = tokenizer.encode("</think>", add_special_tokens=False)
     newline_token = tokenizer.encode("\n", add_special_tokens=False)[0]
     
-    # The key fix: use the current length of padded inputs as baseline
     initial_input_length = padded_inputs.shape[1]
     batch_size = padded_inputs.shape[0]
+    device = padded_inputs.device
     
     return ThinkingTokenBudgetProcessor(
         max_thinking_tokens=max_thinking_tokens,
         think_end_token_ids=think_end_tokens,
         newline_token_id=newline_token,
         initial_input_length=initial_input_length,
-        batch_size=batch_size
+        batch_size=batch_size,
+        device=device
     )
 
 # ──────────────────────────────────────────────────────────────────────────
-# 3. Text processing functions
+# 3. FIXED Text processing functions
 # ──────────────────────────────────────────────────────────────────────────
 def split_reasoning_answer(text: str, tokenizer=None):
     """Split the generated text into reasoning and answer parts."""
     reasoning = None
     answer = None
     
-    # Now that <think> is in the prompt, the generated text should start with reasoning content
-    if "</think>" in text:
+    # Debug what we're parsing
+    if len(text) > 50:
+        print(f"DEBUG: Parsing text start: {repr(text[:100])}")
+        print(f"DEBUG: Contains </think>: {'</think>' in text}")
+        print(f"DEBUG: Contains <answer>: {'<answer>' in text}")
+    
+    # Look for </think> and <answer> tags
+    if "</think>" in text and "<answer>" in text:
+        # Split on </think>
         think_end = text.find("</think>")
-        # If text starts with <think>, remove it; otherwise extract everything before </think>
         if text.startswith("<think>"):
             reasoning = text[7:think_end].strip()  # Remove <think> and extract content
         else:
             reasoning = text[:think_end].strip()
         
-        # The rest after </think>
+        # Extract answer part
         remaining_text = text[think_end + 8:].strip()
+        answer_start = remaining_text.find("<answer>")
+        if answer_start >= 0:
+            answer_content = remaining_text[answer_start + 8:]
+            answer_end = answer_content.find("</answer>")
+            if answer_end >= 0:
+                answer = answer_content[:answer_end].strip()
+            else:
+                answer = answer_content.strip()
         
-        # Extract answer
-        if "<answer>" in remaining_text:
-            answer_start = remaining_text.find("<answer>")
-            answer_end = remaining_text.find("</answer>")
-            if answer_end > answer_start:
-                answer = remaining_text[answer_start + 8:answer_end].strip()
-            else:
-                answer = remaining_text[answer_start + 8:].strip()
+    elif "</think>" in text:
+        # Only reasoning, no answer section
+        think_end = text.find("</think>")
+        if text.startswith("<think>"):
+            reasoning = text[7:think_end].strip()
         else:
-            answer = remaining_text.strip()
+            reasoning = text[:think_end].strip()
+        answer = "No answer provided."
+        
+    elif "<answer>" in text:
+        # Only answer, no reasoning
+        answer_start = text.find("<answer>")
+        answer_content = text[answer_start + 8:]
+        answer_end = answer_content.find("</answer>")
+        if answer_end >= 0:
+            answer = answer_content[:answer_end].strip()
+        else:
+            answer = answer_content.strip()
+        reasoning = "No reasoning provided."
+        
     else:
-        # Fallback if no </think> found
-        if "<answer>" in text:
-            answer_start = text.find("<answer>")
-            answer_end = text.find("</answer>")
-            if answer_end > answer_start:
-                answer = text[answer_start + 8:answer_end].strip()
-            else:
-                answer = text[answer_start + 8:].strip()
-        else:
-            answer = text.strip()
+        # No tags found - treat as raw response
+        reasoning = "No reasoning provided."
+        answer = text.strip()
     
     reasoning_tokens = len(tokenizer.encode(reasoning)) if reasoning and tokenizer else 0
     answer_tokens = len(tokenizer.encode(answer)) if answer and tokenizer else 0
+    
+    print(f"DEBUG: Parsed - reasoning: {len(reasoning or '')} chars, answer: {len(answer or '')} chars")
     
     return reasoning, answer, reasoning_tokens, answer_tokens
 
@@ -222,7 +248,7 @@ def load_dataset(path: str = "prompts.json", limit: int = -1, seed: int = 42):
     return [p for p, _ in shuff], [c for _, c in shuff]
 
 # ──────────────────────────────────────────────────────────────────────────
-# 4. Generation functions
+# 4. FIXED Generation functions
 # ──────────────────────────────────────────────────────────────────────────
 def generate_batch_sync(
     model,
@@ -279,17 +305,20 @@ def generate_batch_sync(
     for i, (question, conflict) in enumerate(zip(questions, conflicts)):
         full_text = tokenizer.decode(outputs[i], skip_special_tokens=True)
         
+        # FIXED: Extract generated content properly
         if "Assistant: <think>" in full_text:
-            new_text = full_text.split("Assistant: <think>", 1)[1]
-            new_text = "<think>" + new_text
+            # Split and keep the generated part
+            generated_part = full_text.split("Assistant: <think>", 1)[1]
+            new_text = "<think>" + generated_part
         else:
+            # Fallback
             new_text = full_text
         
         reasoning, answer, reasoning_tokens, response_tokens = split_reasoning_answer(new_text, tokenizer)
         results.append(dict(
             question=question,
-            response=answer,
-            reasoning=reasoning,
+            response=answer,  # This should be the clean answer now
+            reasoning=reasoning,  # This should be the thinking content
             conflict=conflict,
             reasoning_tokens=reasoning_tokens,
             response_tokens=response_tokens
@@ -370,6 +399,7 @@ def run_sync(
         print(f"\nFinal Statistics:")
         print(f"Average reasoning tokens: {sum(all_reasoning_tokens) / len(all_reasoning_tokens):.1f}")
         print(f"Average response tokens: {sum(all_response_tokens) / len(all_response_tokens):.1f}")
+        print(f"Total samples processed: {len(all_reasoning_tokens)}")
     
     print(f"Results saved to: {outfile}")
 
