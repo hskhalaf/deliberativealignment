@@ -2,11 +2,7 @@ import asyncio
 import json
 from openai import OpenAI
 import os
-import random
 from pathlib import Path
-from datetime import datetime
-
-random.seed(42) 
 
 # Load OpenAI configs
 CONFIG = json.loads(Path("openai_configs.json").read_text())
@@ -103,39 +99,26 @@ openai_api_base = "http://localhost:8000/v1"
 client = OpenAI(api_key=openai_api_key, base_url=openai_api_base)
 
 def make_dataset():
-    # Load from openai_safety_prompts_casual.json instead of prompts.json
-    with open("openai_safety_prompts_casual.json", "r", encoding="utf-8") as f:
+    with open("openai_prompts.json", "r", encoding="utf-8") as f:
         data = json.load(f)
     
-    # Extract prompts from the structure
     if "prompts" in data:
-        prompts_data = data["prompts"]
+        items = data["prompts"]
     else:
-        prompts_data = data
+        items = data
     
-    good, skipped = [], 0
-    for item in prompts_data:
-        if "prompt" in item and "conflict" in item:
-            good.append(item)
-        else:
-            skipped += 1
-
-    if skipped:
-        print(f"[WARN] skipped {skipped} records lacking 'prompt' or 'conflict'")
-
-    prompts   = [it["prompt"]   for it in good]
-    conflicts = [it["conflict"] for it in good]
-    
-    print(f"[INFO] Loaded {len(good)} valid prompts")
-    return PromptTemplate(), prompts, conflicts
+    print(f"[INFO] Loaded {len(items)} prompts")
+    return PromptTemplate(), items
 
 
-async def fetch_response(model, question, conflict, prompt_template, timeout=300):
-    n_generation = 10  # Keep 10 generations as requested
+async def fetch_response(model, item, prompt_template, timeout=300):
+    n_generation = 10
     temp = 0.6
     top_p = 0.95
     max_tokens = 32768
 
+    question = item["prompt"]
+    
     formatted_prompt = prompt_template.generate_code_prompt(question)
     messages = [{"role": "user", "content": formatted_prompt}]
     loop = asyncio.get_running_loop()
@@ -150,7 +133,7 @@ async def fetch_response(model, question, conflict, prompt_template, timeout=300
             max_tokens=max_tokens,
         )), timeout)
         
-        # Collect all responses and reasoning from all choices
+        
         responses = []
         reasonings = []
         
@@ -173,10 +156,14 @@ async def fetch_response(model, question, conflict, prompt_template, timeout=300
         reasonings = [None] * n_generation
     
     return {
-        "question": question,
-        "responses": responses,  # Now a list of all responses
-        "reasonings": reasonings,  # Now a list of all reasoning content
-        "conflict": conflict,
+        "prompt": item["prompt"],
+        "conflict": item["conflict"],
+        "approach": item["approach"],
+        "intensity": item["intensity"], 
+        "context": item["context"],
+        "config_categories": item["config_categories"],
+        "responses": responses,
+        "reasonings": reasonings,
     }
 
 async def main():
@@ -185,44 +172,36 @@ async def main():
         model = models.data[0].id
         print(f"[INFO] Using model: {model}")
         
-        prompt_template, questions, conflicts = make_dataset()
-        batch_size = 8  # Reduced batch size to avoid overwhelming the server
+        prompt_template, items = make_dataset()
+        batch_size = 256
         
-        os.makedirs("safetyresults", exist_ok=True)
-        
-        # Create timestamped filename instead of appending
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = f"safetyresults/openai_configs_{model.lower()}_{timestamp}.jsonl"
+        os.makedirs("openairesults", exist_ok=True)
+        output_file = f"openairesults/openai_configs_{model.lower()}.jsonl"
         print(f"[INFO] Will write results to: {output_file}")
         
         total_processed = 0
-        total_batches = (len(questions) - 1) // batch_size + 1
+        total_batches = (len(items) - 1) // batch_size + 1
         
-        for i in range(0, len(questions), batch_size):
+        for i in range(0, len(items), batch_size):
             current_batch = i // batch_size + 1
             remaining_batches = total_batches - current_batch
             print(f"[INFO] Processing batch {current_batch}/{total_batches} (remaining: {remaining_batches})")
             
-            batched_question = questions[i:i+batch_size]
-            batched_conflicts = conflicts[i:i+batch_size]
-            tasks = [fetch_response(model, q, c, prompt_template) for q, c in zip(batched_question, batched_conflicts)]
+            batched_items = items[i:i+batch_size]
+            tasks = [fetch_response(model, item, prompt_template) for item in batched_items]
             batch_results = await asyncio.gather(*tasks)
 
-            # Write batch results immediately
             with open(output_file, "a", encoding="utf-8") as f:
                 for item in batch_results:
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")
                     total_processed += 1
             
             print(f"[INFO] Batch {current_batch} completed. Total processed: {total_processed}")
-            
-            # Add small delay between batches to avoid overwhelming the server
             await asyncio.sleep(1)
         
         print(f"[INFO] All processing complete. Total items: {total_processed}")
         print(f"[INFO] Results saved to: {output_file}")
         
-        # Verify file was written
         if os.path.exists(output_file):
             with open(output_file, "r", encoding="utf-8") as f:
                 line_count = sum(1 for _ in f)
