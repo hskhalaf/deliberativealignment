@@ -27,27 +27,13 @@ class PromptTemplate:
         "The assistant is a helpful model that first thinks about the reasoning "
         "process in the mind and then provides the user with the answer.\n"
         "The reasoning process and answer are enclosed within <think> </think> "
-        "and <answer> </answer> tags, respectively, i.e.\n"
-        "{think_tag}\n"
-        "{reasoning}\n"
-        "{think_end_tag}\n"
-        "{answer_tag}\n"
-        "{solution}\n"
-        "{answer_end_tag}\n\n"
+        "and <answer> </answer> tags, respectively.\n\n"
         "User: {question}\n"
-        "Assistant: <think>\n"
+        "Assistant: <think>\nLet me think about this step by step.\n\n"
     )
 
     def generate(self, question: str) -> str:
-        return self._template.format(
-            question=question.strip(),
-            think_tag="<think>",
-            reasoning="Provide reasoning here",
-            think_end_tag="</think>",
-            answer_tag="<answer>",
-            solution="[Provide the answer here]",
-            answer_end_tag="</answer>",
-        )
+        return self._template.format(question=question.strip())
 
 # ──────────────────────────────────────────────────────────────────────────
 # 2.  FIXED Thinking Token Budget Processor
@@ -87,10 +73,23 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
         if len(sequence) < think_end_len:
             return False
             
+        # DEBUG: Show what we're looking for vs what we found
+        if not hasattr(self, 'debug_shown'):
+            print(f"DEBUG: Looking for </think> tokens: {self.think_end_token_ids.tolist()}")
+            print(f"DEBUG: Last few tokens of sequence: {sequence[-10:].tolist()}")
+            # Decode the last few tokens to see what they are
+            last_tokens = sequence[-min(10, len(sequence)):].cpu().tolist()
+            print(f"DEBUG: Last tokens decoded: {repr(self.tokenizer.decode(last_tokens) if hasattr(self, 'tokenizer') else 'no tokenizer')}")
+            self.debug_shown = True
+            
         # Look for think_end pattern in the sequence
         sequence = sequence.to(self.think_end_token_ids.device)
         for i in range(think_end_len, len(sequence) + 1):
             if torch.equal(sequence[i-think_end_len:i], self.think_end_token_ids):
+                if not hasattr(self, 'found_debug'):
+                    print(f"DEBUG: Found </think> at position {i-think_end_len} to {i}")
+                    print(f"DEBUG: Matched tokens: {sequence[i-think_end_len:i].tolist()}")
+                    self.found_debug = True
                 return True
         return False
     
@@ -153,15 +152,19 @@ def create_thinking_budget_processor(
 ) -> ThinkingTokenBudgetProcessor:
     """Create a thinking budget processor for the given batch."""
     
-    # Get token IDs
+    # Get token IDs with debug
     think_end_tokens = tokenizer.encode("</think>", add_special_tokens=False)
     newline_token = tokenizer.encode("\n", add_special_tokens=False)[0]
+    
+    # DEBUG: Verify tokenization
+    print(f"DEBUG: '</think>' tokenizes to: {think_end_tokens}")
+    print(f"DEBUG: Decoded back: {repr(tokenizer.decode(think_end_tokens))}")
     
     initial_input_length = padded_inputs.shape[1]
     batch_size = padded_inputs.shape[0]
     device = padded_inputs.device
     
-    return ThinkingTokenBudgetProcessor(
+    processor = ThinkingTokenBudgetProcessor(
         max_thinking_tokens=max_thinking_tokens,
         think_end_token_ids=think_end_tokens,
         newline_token_id=newline_token,
@@ -169,6 +172,11 @@ def create_thinking_budget_processor(
         batch_size=batch_size,
         device=device
     )
+    
+    # Give processor access to tokenizer for debugging
+    processor.tokenizer = tokenizer
+    
+    return processor
 
 # ──────────────────────────────────────────────────────────────────────────
 # 3. FIXED Text processing functions
