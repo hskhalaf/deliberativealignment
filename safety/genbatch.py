@@ -6,6 +6,7 @@ import random
 import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+from datetime import datetime
 
 import torch
 from transformers import (
@@ -292,6 +293,7 @@ async def generate_batch(
             reasoning_tokens=reasoning_tokens,
             response_tokens=response_tokens
         ))
+    return results
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -326,7 +328,17 @@ async def run(
     template = PromptTemplate()
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    outfile = output_dir / f"{model_name.replace('/', '_')}_think{think_tokens}.jsonl"
+    
+    # CREATE ONE TIMESTAMPED FILE PER RUN
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_short = model_name.split('/')[-1]
+    outfile = output_dir / f"{model_short}_think{think_tokens}_batch{batch}_{timestamp}.jsonl"
+    
+    print(f"Output file: {outfile}")
+
+    # CLEAR THE FILE AT START OF RUN (not per batch)
+    if outfile.exists():
+        outfile.unlink()
 
     # Use a single ThreadPoolExecutor for the blocking model.generate calls
     from concurrent.futures import ThreadPoolExecutor
@@ -358,10 +370,11 @@ async def run(
                 pool,
             )
 
-            # Collect statistics
+            # Collect statistics and save ALL BATCHES TO SAME FILE
             batch_reasoning_tokens = []
             batch_response_tokens = []
             
+            # APPEND MODE - adds each batch to the same file
             with outfile.open("a", encoding="utf‑8") as f:
                 for obj in results:
                     f.write(json.dumps(obj, ensure_ascii=False) + "\n")
