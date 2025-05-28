@@ -62,38 +62,15 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
         max_thinking_tokens: int,
         think_end_token_ids: List[int],
         newline_token_id: int,
-        padded_inputs: torch.Tensor  # Pass the actual padded inputs
+        initial_input_length: int  # Length of the padded inputs when generation starts
     ):
         self.max_thinking_tokens = max_thinking_tokens
-        # Put tensors on the same device as the model inputs
-        device = padded_inputs.device
-        self.think_end_token_ids = torch.tensor(think_end_token_ids, device=device)
+        self.think_end_token_ids = torch.tensor(think_end_token_ids)
         self.newline_token_id = newline_token_id
+        self.initial_input_length = initial_input_length  # This is the baseline
         
-        # Calculate where thinking should end for each sequence
-        # Find the actual start of generation (after padding and prompt)
-        batch_size = padded_inputs.shape[0]
-        self.thinking_start_positions = []
-        
-        for i in range(batch_size):
-            # Find first non-pad token position for this sequence
-            sequence = padded_inputs[i]
-            non_pad_start = 0
-            for j, token_id in enumerate(sequence):
-                if token_id != 0:  # Assuming 0 is pad token
-                    non_pad_start = j
-                    break
-            
-            # The thinking starts right after the prompt (which ends with <think>)
-            prompt_end = len(sequence)  # Full length including prompt
-            self.thinking_start_positions.append(prompt_end)
-        
-        # Track state per sequence
-        self.thinking_token_counts = [0] * batch_size
-        self.in_thinking_mode = [True] * batch_size
-        self.forcing_closure = [False] * batch_size
-        
-        print(f"DEBUG: Thinking processor initialized - max tokens: {max_thinking_tokens}, batch size: {batch_size}")
+        print(f"DEBUG: Thinking processor initialized - max tokens: {max_thinking_tokens}")
+        print(f"DEBUG: Initial input length: {initial_input_length}")
     
     def _sequence_contains_think_end(self, sequence: torch.Tensor) -> bool:
         """Check if sequence contains </think> tokens"""
@@ -102,7 +79,6 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
             
         # Look for think_end pattern in the sequence
         for i in range(len(self.think_end_token_ids), len(sequence) + 1):
-            # Make sure both tensors are on the same device
             sequence_slice = sequence[i-len(self.think_end_token_ids):i].to(self.think_end_token_ids.device)
             if torch.equal(sequence_slice, self.think_end_token_ids):
                 return True
@@ -112,35 +88,37 @@ class ThinkingTokenBudgetProcessor(LogitsProcessor):
         batch_size = input_ids.shape[0]
         current_length = input_ids.shape[1]
         
-        # Early exit if no sequences are in thinking mode
-        if not any(self.in_thinking_mode):
+        # Calculate how many tokens have been generated since the start
+        tokens_generated = current_length - self.initial_input_length
+        
+        # Debug on first few calls
+        if not hasattr(self, 'call_count'):
+            self.call_count = 0
+        self.call_count += 1
+        
+        if self.call_count <= 5:
+            print(f"DEBUG: Call #{self.call_count} - current_length: {current_length}, initial: {self.initial_input_length}, generated: {tokens_generated}")
+        
+        # Early exit if no tokens generated yet
+        if tokens_generated <= 0:
             return scores
         
         # Process each sequence
         for i in range(batch_size):
-            if not self.in_thinking_mode[i]:
-                continue
-            
             sequence = input_ids[i]
             
             # Check if this sequence naturally ended thinking
             if self._sequence_contains_think_end(sequence):
-                self.in_thinking_mode[i] = False
-                self.forcing_closure[i] = False
-                print(f"DEBUG: Seq {i} - Natural </think> found (thinking tokens: {self.thinking_token_counts[i]})")
+                if self.call_count % 20 == 0:  # Less frequent debug
+                    print(f"DEBUG: Seq {i} - Natural </think> found (tokens generated: {tokens_generated})")
                 continue
             
-            # Count thinking tokens (tokens generated after the initial prompt)
-            thinking_tokens = current_length - self.thinking_start_positions[i]
-            self.thinking_token_counts[i] = max(0, thinking_tokens)  # Don't go negative
-            
             # Check if we need to force closure
-            if self.thinking_token_counts[i] >= self.max_thinking_tokens and not self.forcing_closure[i]:
-                print(f"DEBUG: Seq {i} - Hit thinking budget ({self.thinking_token_counts[i]}/{self.max_thinking_tokens}), forcing </think>")
-                self.forcing_closure[i] = True
-            
-            # Apply forced closure
-            if self.forcing_closure[i]:
+            if tokens_generated >= self.max_thinking_tokens:
+                if self.call_count % 20 == 0:
+                    print(f"DEBUG: Seq {i} - Hit thinking budget ({tokens_generated}/{self.max_thinking_tokens}), forcing </think>")
+                
+                # Apply forced closure
                 scores[i] = torch.full_like(scores[i], -math.inf)
                 
                 # Force newline first, then </think>
@@ -163,11 +141,14 @@ def create_thinking_budget_processor(
     think_end_tokens = tokenizer.encode("</think>", add_special_tokens=False)
     newline_token = tokenizer.encode("\n", add_special_tokens=False)[0]
     
+    # The key fix: use the current length of padded inputs as baseline
+    initial_input_length = padded_inputs.shape[1]
+    
     return ThinkingTokenBudgetProcessor(
         max_thinking_tokens=max_thinking_tokens,
         think_end_token_ids=think_end_tokens,
         newline_token_id=newline_token,
-        padded_inputs=padded_inputs
+        initial_input_length=initial_input_length  # All sequences use same baseline
     )
 
 # ──────────────────────────────────────────────────────────────────────────
